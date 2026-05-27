@@ -176,6 +176,8 @@ let withdrawInProgress = false;
 let trustSearchDebounceTimer = null;
 let trustSearchRequestId = 0;
 let userGroupAddresses = new Set();
+let selectedTrustAddrs = new Set();
+let cachedTrustAddrs = [];
 let selectedOrgImageDataUrl = '';
 let orgImageProcessing = false;
 let orgFormMode = 'create';
@@ -219,6 +221,15 @@ const trustAddrInput = document.getElementById('trust-address');
 const addTrustBtn = document.getElementById('add-trust-btn');
 const trustSearchResultsEl = document.getElementById('trust-search-results');
 const trustListEl = document.getElementById('trust-list');
+const trustSelectionToolbarEl = document.getElementById('trust-selection-toolbar');
+const trustSelectAllInput = document.getElementById('trust-select-all');
+const trustSelectionCountEl = document.getElementById('trust-selection-count');
+const trustUntrustSelectedBtn = document.getElementById('trust-untrust-selected-btn');
+const confirmModalEl = document.getElementById('confirm-modal');
+const confirmModalTitleEl = document.getElementById('confirm-modal-title');
+const confirmModalMessageEl = document.getElementById('confirm-modal-message');
+const confirmModalCancelBtn = document.getElementById('confirm-modal-cancel');
+const confirmModalConfirmBtn = document.getElementById('confirm-modal-confirm');
 const safeSignerAddressInput = document.getElementById('safe-signer-address');
 const addSafeSignerBtn = document.getElementById('add-safe-signer-btn');
 const safeSignersListEl = document.getElementById('safe-signers-list');
@@ -254,6 +265,53 @@ const BACK_BUTTON_ICON_HTML = `
 `;
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
+
+let confirmModalResolver = null;
+let confirmModalKeyHandler = null;
+
+function closeConfirmModal(confirmed) {
+  if (confirmModalKeyHandler) {
+    window.removeEventListener('keydown', confirmModalKeyHandler);
+    confirmModalKeyHandler = null;
+  }
+
+  confirmModalEl.classList.add('hidden');
+  confirmModalEl.setAttribute('aria-hidden', 'true');
+
+  const resolver = confirmModalResolver;
+  confirmModalResolver = null;
+  if (resolver) resolver(Boolean(confirmed));
+}
+
+function showConfirmModal({
+  title,
+  message,
+  confirmLabel = 'Continue',
+  cancelLabel = 'Cancel',
+}) {
+  if (confirmModalResolver) {
+    closeConfirmModal(false);
+  }
+
+  confirmModalTitleEl.textContent = title;
+  confirmModalMessageEl.textContent = message;
+  confirmModalConfirmBtn.textContent = confirmLabel;
+  confirmModalCancelBtn.textContent = cancelLabel;
+  confirmModalEl.classList.remove('hidden');
+  confirmModalEl.setAttribute('aria-hidden', 'false');
+
+  return new Promise((resolve) => {
+    confirmModalResolver = resolve;
+    confirmModalKeyHandler = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeConfirmModal(false);
+      }
+    };
+    window.addEventListener('keydown', confirmModalKeyHandler);
+    confirmModalConfirmBtn.focus();
+  });
+}
 
 function showResult(type, html) {
   resultEl.className = `result result-${type}`;
@@ -2149,7 +2207,7 @@ async function addTrust(preselectedAddress = null) {
 }
 
 async function removeTrust(addr) {
-  const btns = trustListEl.querySelectorAll(`[data-addr="${addr}"]`);
+  const btns = trustListEl.querySelectorAll(`.trust-untrust-btn[data-addr="${addr}"]`);
   btns.forEach((b) => (b.disabled = true));
   showResult('pending', 'Requesting approval…');
 
@@ -2283,6 +2341,9 @@ async function withdrawAllHoldings() {
 
 async function loadTrustRelations() {
   trustListEl.innerHTML = '<div class="shimmer-block"></div>';
+  selectedTrustAddrs = new Set();
+  cachedTrustAddrs = [];
+  updateTrustSelectionUI();
 
   if (!orgSdk || !activeOrgAddress) {
     trustListEl.innerHTML = '<p class="muted">No organization selected.</p>';
@@ -2298,6 +2359,7 @@ async function loadTrustRelations() {
 
     if (!outgoingRelations || outgoingRelations.length === 0) {
       trustListEl.innerHTML = '<p class="muted">No trust relations yet.</p>';
+      updateTrustSelectionUI();
       return;
     }
 
@@ -2307,6 +2369,7 @@ async function loadTrustRelations() {
       .map((addr) => getAddress(addr));
 
     const uniqueTrustAddrs = [...new Set(normalizedTrustAddrs)];
+    cachedTrustAddrs = uniqueTrustAddrs;
     const trustNameByAddr = new Map();
     await Promise.all(
       uniqueTrustAddrs.map(async (addr) => {
@@ -2320,32 +2383,126 @@ async function loadTrustRelations() {
       })
     );
 
-    trustListEl.innerHTML = outgoingRelations
-      .map((r) => {
-        const addr =
-          r.objectAvatar || r.trustee || r.address || (typeof r === 'string' ? r : '');
-        if (!isAddress(addr)) return '';
-        const normalizedAddr = getAddress(addr);
-        const displayLabel = trustNameByAddr.get(normalizedAddr.toLowerCase()) || normalizedAddr;
-        const userGroupBadge = userGroupAddresses.has(normalizedAddr.toLowerCase())
+    trustListEl.innerHTML = uniqueTrustAddrs
+      .map((normalizedAddr) => {
+        const key = normalizedAddr.toLowerCase();
+        const displayLabel = trustNameByAddr.get(key) || normalizedAddr;
+        const userGroupBadge = userGroupAddresses.has(key)
           ? '<span class="badge badge-success trust-your-group">Your group</span>'
           : '';
+        const checked = selectedTrustAddrs.has(key) ? 'checked' : '';
         return `
           <div class="trust-item">
+            <label class="trust-item-select checkbox-inline">
+              <input type="checkbox" class="trust-select-checkbox" data-addr="${escapeHtml(normalizedAddr)}" ${checked} />
+            </label>
             <div class="trust-item-label">
               <a class="trust-addr" href="https://explorer.aboutcircles.com/avatar/${normalizedAddr}/" target="_blank" title="${escapeHtml(normalizedAddr)}">${escapeHtml(displayLabel)}</a>
               ${userGroupBadge}
             </div>
-            <button class="btn-sm btn-danger" data-addr="${escapeHtml(normalizedAddr)}">Untrust</button>
+            <button class="btn-sm btn-danger trust-untrust-btn" data-addr="${escapeHtml(normalizedAddr)}">Untrust</button>
           </div>`;
       })
       .join('');
 
-    trustListEl.querySelectorAll('.btn-danger').forEach((btn) => {
+    trustListEl.querySelectorAll('.trust-untrust-btn').forEach((btn) => {
       btn.addEventListener('click', () => removeTrust(btn.dataset.addr));
     });
+
+    trustListEl.querySelectorAll('.trust-select-checkbox').forEach((input) => {
+      input.addEventListener('change', () => {
+        const key = String(input.dataset.addr || '').toLowerCase();
+        if (!key) return;
+        if (input.checked) selectedTrustAddrs.add(key);
+        else selectedTrustAddrs.delete(key);
+        updateTrustSelectionUI();
+      });
+    });
+
+    updateTrustSelectionUI();
   } catch (err) {
     trustListEl.innerHTML = `<p class="muted">Error loading trust: ${decodeError(err)}</p>`;
+    updateTrustSelectionUI();
+  }
+}
+
+function updateTrustSelectionUI() {
+  if (!trustSelectionToolbarEl) return;
+
+  const hasRows = cachedTrustAddrs.length > 0;
+  if (!hasRows) {
+    trustSelectionToolbarEl.classList.add('hidden');
+  } else {
+    trustSelectionToolbarEl.classList.remove('hidden');
+  }
+
+  const totalSelected = selectedTrustAddrs.size;
+
+  if (trustSelectAllInput) {
+    trustSelectAllInput.disabled = !hasRows;
+    trustSelectAllInput.checked = hasRows && totalSelected === cachedTrustAddrs.length;
+    trustSelectAllInput.indeterminate = totalSelected > 0 && totalSelected < cachedTrustAddrs.length;
+  }
+
+  if (trustSelectionCountEl) {
+    trustSelectionCountEl.textContent = `${totalSelected} selected`;
+  }
+
+  if (trustUntrustSelectedBtn) {
+    trustUntrustSelectedBtn.disabled = totalSelected === 0;
+    trustUntrustSelectedBtn.textContent =
+      totalSelected > 1 ? `Untrust ${totalSelected} selected` : 'Untrust selected';
+  }
+}
+
+async function bulkRemoveTrust() {
+  if (!avatar) {
+    showResult('error', 'Organization wallet is not ready.');
+    return;
+  }
+
+  const addresses = [...selectedTrustAddrs]
+    .filter((addr) => isAddress(addr))
+    .map((addr) => getAddress(addr));
+
+  if (!addresses.length) {
+    showResult('error', 'No trust relations selected.');
+    return;
+  }
+
+  const isBatch = addresses.length > 1;
+  const confirmed = await showConfirmModal({
+    title: isBatch ? `Untrust ${addresses.length} avatars?` : 'Untrust avatar?',
+    message: isBatch
+      ? `This will untrust ${addresses.length} avatars in a single batched transaction.`
+      : `This will untrust ${truncAddr(addresses[0])}.`,
+    confirmLabel: 'Untrust',
+  });
+  if (!confirmed) return;
+
+  if (trustUntrustSelectedBtn) trustUntrustSelectedBtn.disabled = true;
+  trustListEl.querySelectorAll('.trust-untrust-btn').forEach((b) => (b.disabled = true));
+  showResult('pending', isBatch ? `Untrusting ${addresses.length} avatars…` : 'Requesting approval…');
+
+  try {
+    lastTxHashes = [];
+    // SDK builds one hubV2.trust(addr, 0) tx per address (zero expiry = untrust)
+    // and the Safe runner MultiSend-batches them into a single atomic transaction.
+    await avatar.trust.remove(addresses);
+
+    const links = lastTxHashes.length ? `<br>${txLinks(lastTxHashes)}` : '';
+    showResult(
+      'success',
+      isBatch
+        ? `Removed trust for ${addresses.length} avatars.${links}`
+        : `Removed trust for ${truncAddr(addresses[0])}.${links}`
+    );
+    selectedTrustAddrs = new Set();
+    await loadTrustRelations();
+  } catch (err) {
+    showResult('error', `Untrust failed: ${decodeError(err)}`);
+    if (trustUntrustSelectedBtn) trustUntrustSelectedBtn.disabled = false;
+    trustListEl.querySelectorAll('.trust-untrust-btn').forEach((b) => (b.disabled = false));
   }
 }
 
@@ -2436,6 +2593,9 @@ async function openOwnedOrganization(orgSafeAddress, options = {}) {
   if (editOrgBtn) editOrgBtn.disabled = true;
   safeSignersListEl.innerHTML = '<div class="shimmer-block"></div>';
   trustListEl.innerHTML = '<div class="shimmer-block"></div>';
+  selectedTrustAddrs = new Set();
+  cachedTrustAddrs = [];
+  updateTrustSelectionUI();
   if (withdrawHoldingsListEl) withdrawHoldingsListEl.innerHTML = '<div class="shimmer-block"></div>';
   updateWithdrawAvailableText();
   updateWithdrawButtonState();
@@ -2604,6 +2764,27 @@ if (typeof window !== 'undefined') {
 
 registerBtn.addEventListener('click', submitOrganizationForm);
 addTrustBtn.addEventListener('click', () => addTrust());
+trustSelectAllInput?.addEventListener('change', () => {
+  if (trustSelectAllInput.checked) {
+    for (const addr of cachedTrustAddrs) selectedTrustAddrs.add(addr.toLowerCase());
+  } else {
+    selectedTrustAddrs.clear();
+  }
+  trustListEl.querySelectorAll('.trust-select-checkbox').forEach((input) => {
+    const key = String(input.dataset.addr || '').toLowerCase();
+    input.checked = selectedTrustAddrs.has(key);
+  });
+  updateTrustSelectionUI();
+});
+trustUntrustSelectedBtn?.addEventListener('click', () => {
+  if (!selectedTrustAddrs.size) return;
+  void bulkRemoveTrust();
+});
+confirmModalCancelBtn?.addEventListener('click', () => closeConfirmModal(false));
+confirmModalConfirmBtn?.addEventListener('click', () => closeConfirmModal(true));
+confirmModalEl?.addEventListener('click', (event) => {
+  if (event.target === confirmModalEl) closeConfirmModal(false);
+});
 addSafeSignerBtn.addEventListener('click', addSafeSigner);
 withdrawAllBtn?.addEventListener('click', withdrawAllHoldings);
 fundAmountXdaiInput.addEventListener('input', updateFundFaucetButtonState);
